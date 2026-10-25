@@ -1,16 +1,19 @@
 import copy
 import ipaddress
+import re
 import sys
 
-from .host import generate_keypair, get_public_ip, local_ipv4_networks
+from .fsutil import write_private_file
+from .host import generate_keypair, get_public_ip, interface_status, local_ipv4_networks
 from .model import get_next_interface_name, get_random_port, get_random_subnet
 from .prompts import ask, confirm, get_input
+from .rendering import ENDPOINT_PLACEHOLDER, render_client_config
 from .service import apply_client_config, ensure_interface_unused, remove_client_config
 from .validation import (SENSITIVE_PORTS, check_interface_free, check_listen_port_free,
                          check_name_free, check_public_port_free, check_subnet_free,
                          client_ip_for, validate_comment, validate_interface,
                          validate_name, validate_port, validate_protocol,
-                         validate_server_address)
+                         validate_server_address, validate_wg_key)
 
 
 # --- Validators that know about the rest of the config -------------------------
@@ -50,6 +53,10 @@ def listen_port_validator(others, rules=()):
     return check
 
 
+def optional_key(value):
+    return validate_wg_key(value) if value else ""
+
+
 def used_ports(others, rules=(), listen_port=None):
     ports = {c['listen_port'] for c in others} | {r['public_port'] for c in others for r in c['rules']}
     ports |= {r['public_port'] for r in rules}
@@ -71,32 +78,78 @@ def select_client(config, action):
     return choice - 1
 
 
+# --- Forwarding rules ------------------------------------------------------------
+
+def describe_rule(rule):
+    return f"{rule['protocol']}:{rule['public_port']} -> {rule['target_ip']}:{rule['target_port']}  ({rule.get('comment', 'Rule')})"
+
+
+def prompt_for_rule(target_ip, others, listen_port, rules):
+    """Ask for one forwarding rule; returns None if the user backs out."""
+    comment = ask("  Description (e.g. Web Server)", "Forwarded Rule", validate_comment)
+    protocol = ask("  Protocol (tcp/udp)", "tcp", validate_protocol)
+
+    def check_public(value):
+        port = validate_port(value)
+        check_public_port_free(others, protocol, port, rules, listen_port)
+        return port
+    pub_port = ask("  Public Port on Server", get_random_port(used_ports(others, rules, listen_port)), check_public)
+    if pub_port in SENSITIVE_PORTS and not confirm(
+            f"  Port {pub_port} ({SENSITIVE_PORTS[pub_port]}) is used by the VPS itself; forwarding it will hijack that service. Continue?"):
+        return None
+    return {
+        "comment": comment,
+        "protocol": protocol,
+        "public_port": pub_port,
+        "target_ip": target_ip,
+        "target_port": ask("  Target Port on Client", pub_port, validate_port)
+    }
+
+
 def prompt_for_rules(target_ip, others, listen_port):
     print("\n--- Port Forwarding Rules ---")
     rules = []
     while confirm("Add a forwarding rule?", default=True):
         print("  - New Rule -")
-        comment = ask("  Description (e.g. Web Server)", "Forwarded Rule", validate_comment)
-        protocol = ask("  Protocol (tcp/udp)", "tcp", validate_protocol)
-
-        def check_public(value):
-            port = validate_port(value)
-            check_public_port_free(others, protocol, port, rules, listen_port)
-            return port
-        pub_port = ask("  Public Port on Server", get_random_port(used_ports(others, rules, listen_port)), check_public)
-        if pub_port in SENSITIVE_PORTS and not confirm(
-                f"  Port {pub_port} ({SENSITIVE_PORTS[pub_port]}) is used by the VPS itself; forwarding it will hijack that service. Continue?"):
-            continue
-        rules.append({
-            "comment": comment,
-            "protocol": protocol,
-            "public_port": pub_port,
-            "target_ip": target_ip,
-            "target_port": ask("  Target Port on Client", pub_port, validate_port)
-        })
-        print("  > Rule added.")
+        rule = prompt_for_rule(target_ip, others, listen_port, rules)
+        if rule:
+            rules.append(rule)
+            print("  > Rule added.")
     return rules
 
+
+def edit_rules(draft, others):
+    """Add or remove individual forwarding rules on the draft client."""
+    target_ip = client_ip_for(draft['server_address'])
+    while True:
+        print("\n--- Forwarding Rules ---")
+        for i, rule in enumerate(draft['rules'], start=1):
+            print(f"  {i}. {describe_rule(rule)}")
+        if not draft['rules']: print("  (none)")
+        print("1. Add a rule")
+        print("2. Remove a rule")
+        print("3. Back")
+        choice = get_input("Choose an option", "3")
+        if choice == '1':
+            rule = prompt_for_rule(target_ip, others, draft['listen_port'], draft['rules'])
+            if rule: draft['rules'].append(rule)
+        elif choice == '2' and draft['rules']:
+            def parse(value):
+                n = int(value) if value.isdigit() else -1
+                if not 0 <= n <= len(draft['rules']):
+                    raise ValueError(f"enter a number between 0 and {len(draft['rules'])}")
+                return n
+            n = ask("Number of the rule to remove (0 to cancel)", "0", parse)
+            if n: print(f"  > Removed: {describe_rule(draft['rules'].pop(n - 1))}")
+        elif choice == '2':
+            print("There are no rules to remove.")
+        elif choice == '3':
+            return
+        else:
+            print("Invalid selection.", file=sys.stderr)
+
+
+# --- Menu actions ----------------------------------------------------------------
 
 def add_new_client(session):
     config = session.config
@@ -113,9 +166,14 @@ def add_new_client(session):
     server_address = ask("Enter VPN subnet for this client (CIDR)", get_random_subnet(taken), check_subnet)
     client_ip = client_ip_for(server_address)
 
+    print("\nThe client can generate its own keypair (`wg genkey | tee private | wg pubkey`) so its private key never")
+    print("touches this server. Paste its public key, or leave empty to generate a keypair here.")
+    cli_pub = ask("Client public key", required=False, validate=optional_key)
     srv_priv, srv_pub = generate_keypair()
-    cli_priv, cli_pub = generate_keypair()
-    print(f"\n> Generated Server Public Key: {srv_pub}\n> Generated Client Public Key: {cli_pub}")
+    cli_priv = None
+    if not cli_pub:
+        cli_priv, cli_pub = generate_keypair()
+    print(f"\n> Server Public Key: {srv_pub}\n> Client Public Key: {cli_pub}")
 
     listen_port = ask("WireGuard Listen Port for this client", get_random_port(used_ports(clients)),
                       listen_port_validator(clients))
@@ -132,7 +190,7 @@ def add_new_client(session):
         clients.append(client_data)
         session.save()
         print(f"\n[+] Client '{client_name}' added to config.")
-        generate_and_print_client_config(client_data, srv_pub, cli_priv)
+        show_client_config(client_data, srv_pub, cli_priv)
 
 
 def edit_existing_client(session):
@@ -177,8 +235,7 @@ def edit_existing_client(session):
         elif edit_choice == '5':
             draft['full_tunnel'] = confirm("Full tunnel?", default=bool(draft.get('full_tunnel')))
         elif edit_choice == '6':
-            print("\nNote: You will need to re-enter all port forwarding rules.")
-            draft['rules'] = prompt_for_rules(client_ip_for(draft['server_address']), others, draft['listen_port'])
+            edit_rules(draft, others)
         elif edit_choice == '7':
             if draft == original:
                 print("No changes to apply.")
@@ -197,29 +254,26 @@ def edit_existing_client(session):
             print("Invalid selection.", file=sys.stderr)
 
 
-def generate_and_print_client_config(client, server_pubkey, client_privkey):
+def show_client_config(client, server_pubkey, client_privkey):
+    """Print the client's config once (private keys are not stored) and offer to save it."""
     print("\n--- Client Configuration ---")
     public_ip = get_public_ip()
-
-    allowed_ips = "0.0.0.0/0" if client.get('full_tunnel', False) else ipaddress.ip_interface(client['server_address']).network
-
-    dns_line = ""
-    if client.get('full_tunnel', False):
-        dns_line = "DNS = 1.1.1.1\n"
-
-    client_conf_content = f"""[Interface]
-Address = {client['client_allowed_ips'].split('/')[0]}/{client['server_address'].split('/')[1]}
-PrivateKey = {client_privkey}
-{dns_line}
-[Peer]
-PublicKey = {server_pubkey}
-Endpoint = {public_ip}:{client['listen_port']}
-AllowedIPs = {allowed_ips}
-PersistentKeepalive = 25
-"""
-    print(client_conf_content.strip())
-    if public_ip == "<YOUR_SERVER_PUBLIC_IP>":
-        print("\n  > ACTION REQUIRED: You must manually edit the file above and replace '<YOUR_SERVER_PUBLIC_IP>' with your server's public IP address.")
+    text = render_client_config(client, server_pubkey, client_privkey, public_ip)
+    print(text.strip())
+    if public_ip == ENDPOINT_PLACEHOLDER:
+        print(f"\n  > ACTION REQUIRED: replace '{ENDPOINT_PLACEHOLDER}' with your server's public IP address or hostname.")
+    if client_privkey is None:
+        print("\n  > Put the private key matching the public key you supplied into the PrivateKey line.")
+        return
+    print("\n  > This private key is not stored anywhere on the server and cannot be shown again.")
+    if confirm("Save this client config to a file now?"):
+        default_path = re.sub(r"[^A-Za-z0-9._-]+", "-", client['name']) + ".client.conf"
+        path = ask("File path", default_path)
+        try:
+            write_private_file(path, text)
+            print(f"  > Saved to {path} (mode 0600). Move it to the client, then delete it from this server.")
+        except OSError as e:
+            print(f"  Error: could not save {path}: {e}", file=sys.stderr)
 
 
 def list_clients(config, show_details=True):
@@ -232,9 +286,10 @@ def list_clients(config, show_details=True):
         if show_details:
             tunnel_type = "Full Tunnel" if client.get('full_tunnel') else "Split Tunnel"
             print(f"  - {tunnel_type}, Listen Port: {client['listen_port']}, VPN Subnet: {client['server_address']}")
+            print(f"  - Status: {interface_status(client['interface_name'])}")
             print(f"  - Rules: {len(client['rules'])}")
             for j, rule in enumerate(client['rules']):
-                print(f"    {j+1}. {rule['protocol']}:{rule['public_port']} -> {rule['target_ip']}:{rule['target_port']}")
+                print(f"    {j+1}. {describe_rule(rule)}")
     return True
 
 

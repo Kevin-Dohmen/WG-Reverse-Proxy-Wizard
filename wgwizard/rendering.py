@@ -129,3 +129,33 @@ def generate_wg_config_for_client(client_data, public_interface):
         f"AllowedIPs = {client_data['client_allowed_ips']}"
     ])
     return "\n".join(content)
+
+
+CLIENT_KEY_PLACEHOLDER = "<YOUR_CLIENT_PRIVATE_KEY>"
+ENDPOINT_PLACEHOLDER = "<YOUR_SERVER_PUBLIC_IP>"
+
+
+def render_client_config(client, server_public_key, client_private_key, endpoint_host):
+    """The config the client machine needs.
+
+    `client_private_key` is None when the client generated its own keypair and
+    only supplied the public half; a placeholder is shown instead.
+    """
+    interface = ipaddress.ip_interface(client['server_address'])
+    full_tunnel = client.get('full_tunnel', False)
+    lines = [
+        "[Interface]",
+        f"Address = {client_ip_for(client['server_address'])}/{interface.network.prefixlen}",
+        f"PrivateKey = {client_private_key or CLIENT_KEY_PLACEHOLDER}",
+    ]
+    if full_tunnel:
+        lines.append("DNS = 1.1.1.1")
+    lines += [
+        "",
+        "[Peer]",
+        f"PublicKey = {server_public_key}",
+        f"Endpoint = {endpoint_host}:{client['listen_port']}",
+        f"AllowedIPs = {'0.0.0.0/0' if full_tunnel else interface.network}",
+        "PersistentKeepalive = 25",
+    ]
+    return "\n".join(lines) + "\n"

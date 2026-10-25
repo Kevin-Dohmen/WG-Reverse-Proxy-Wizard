@@ -103,24 +103,29 @@ def apply_client_config(client_data, public_interface, previous=None):
         return False
 
     try:
-        os.makedirs(WG_DIR, mode=0o700, exist_ok=True)
-        write_private_file(conf_path(iface_name), config_content)
-        print(f"  > Configuration saved to {conf_path(iface_name)}")
-        if previous_iface != iface_name:
-            manage_service("disable", previous_iface, quiet=True)
-            _remove_conf(previous_iface)
-    except OSError as e:
-        print(f"  Error writing config file: {e}", file=sys.stderr)
+        try:
+            os.makedirs(WG_DIR, mode=0o700, exist_ok=True)
+            write_private_file(conf_path(iface_name), config_content)
+            print(f"  > Configuration saved to {conf_path(iface_name)}")
+            if previous_iface != iface_name:
+                manage_service("disable", previous_iface, quiet=True)
+                _remove_conf(previous_iface)
+        except OSError as e:
+            print(f"  Error writing config file: {e}", file=sys.stderr)
+            _rollback(iface_name, previous_iface, previous_text)
+            return False
+
+        if manage_service("enable", iface_name) and manage_service("start", iface_name):
+            print(f"[+] Client '{client_data['name']}' is now active.")
+            return True
+
+        print(f"[-] Client '{client_data['name']}' failed to start.", file=sys.stderr)
         _rollback(iface_name, previous_iface, previous_text)
         return False
-
-    if manage_service("enable", iface_name) and manage_service("start", iface_name):
-        print(f"[+] Client '{client_data['name']}' is now active.")
-        return True
-
-    print(f"[-] Client '{client_data['name']}' failed to start.", file=sys.stderr)
-    _rollback(iface_name, previous_iface, previous_text)
-    return False
+    except KeyboardInterrupt:
+        # Never leave the interface half-configured and stopped because of a stray Ctrl-C.
+        _rollback(iface_name, previous_iface, previous_text)
+        raise
 
 
 def remove_client_config(client_data):

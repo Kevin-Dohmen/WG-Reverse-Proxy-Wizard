@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 
 from .actions import add_new_client, edit_existing_client, list_clients, remove_client
@@ -10,6 +11,9 @@ from .store import Session
 
 # Menu actions that change the system and therefore need root.
 MUTATING = {'2', '3', '4', '5'}
+
+# State lives next to wizard.py by default, not in whatever directory sudo was started from.
+DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
 
 
 def print_startup_warnings(session):
@@ -23,7 +27,8 @@ def print_startup_warnings(session):
 
 def main():
     parser = argparse.ArgumentParser(description="All-in-One WireGuard Configuration Wizard")
-    parser.add_argument("-f", "--file", default="config.json", help="Path to the JSON configuration file")
+    parser.add_argument("-f", "--file", default=DEFAULT_CONFIG,
+                        help="Path to the JSON configuration file (default: %(default)s)")
     args = parser.parse_args()
 
     try:
@@ -52,7 +57,11 @@ def run_menu(session):
         print("4. Remove a client")
         print("5. Re-apply all configurations")
         print("6. Exit")
-        choice = get_input("Choose an option", "1")
+        try:
+            choice = get_input("Choose an option", "1")
+        except (KeyboardInterrupt, EOFError):
+            print()
+            break
 
         try:
             if choice in MUTATING: check_root()
@@ -61,9 +70,13 @@ def run_menu(session):
             elif choice == '3': edit_existing_client(session)
             elif choice == '4': remove_client(session)
             elif choice == '5': reapply_all_configs(session.config)
-            elif choice == '6':
-                print("Run 'sudo wg show' on the server to see live status.")
-                break
+            elif choice == '6': break
             else: print("Invalid option. Please try again.")
         except WizardError as e:
             print(f"Error: {e}", file=sys.stderr)
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+        except EOFError:
+            print()
+            break
+    print("Run 'sudo wg show' on the server to see live status.")

@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 from .errors import WizardError
 from .fsutil import write_private_file
@@ -93,3 +94,27 @@ def local_ipv4_networks(skip_interfaces=()):
         try: networks.append(ipaddress.ip_interface(parts[3]).network)
         except ValueError: pass
     return networks
+
+
+def format_age(seconds):
+    seconds = int(seconds)
+    if seconds < 60: return f"{seconds}s"
+    if seconds < 3600: return f"{seconds // 60}m"
+    if seconds < 86400: return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def interface_status(interface_name, now=None):
+    """One-line live status of a WireGuard interface (best effort; needs root for details)."""
+    if not interface_exists(interface_name):
+        return "down"
+    try:
+        out = subprocess.run(["wg", "show", interface_name, "latest-handshakes"],
+                             check=True, capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return "up"
+    stamps = [int(parts[1]) for parts in (line.split() for line in out.splitlines()) if len(parts) == 2 and parts[1].isdigit()]
+    latest = max(stamps, default=0)
+    if not latest:
+        return "up, no handshake yet"
+    return f"up, last handshake {format_age((now or time.time()) - latest)} ago"
