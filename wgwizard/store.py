@@ -3,7 +3,7 @@ import os
 
 from .errors import ConfigError
 from .fsutil import write_private_file
-from .system import get_default_public_interface
+from .host import get_default_public_interface
 from .validation import validate_client, validate_public_interface
 
 

@@ -1,10 +1,11 @@
+import copy
 import ipaddress
 import sys
 
+from .host import generate_keypair, get_public_ip
 from .model import get_next_interface_name, get_random_port, get_random_subnet
 from .prompts import ask, confirm, get_input
-from .system import (apply_client_config, generate_keypair, get_public_ip,
-                     remove_client_config)
+from .service import apply_client_config, remove_client_config
 from .validation import (SENSITIVE_PORTS, client_ip_for, validate_comment,
                          validate_interface, validate_name, validate_port,
                          validate_protocol, validate_server_address)
@@ -89,52 +90,60 @@ def edit_existing_client(config):
 
     index = select_client(config, "edit")
     if index is None: return
-    original_client = config['clients'][index]
+    original = config['clients'][index]
+    # Edit a copy; the stored client only changes once the new config is live.
+    draft = copy.deepcopy(original)
 
     while True:
-        print(f"\n--- Editing '{original_client['name']}' ---")
+        print(f"\n--- Editing '{draft['name']}'{' (unsaved changes)' if draft != original else ''} ---")
         print("1. Edit Name")
         print("2. Edit Interface Name")
         print("3. Edit VPN Subnet")
         print("4. Edit Listen Port")
         print("5. Edit Full Tunnel Status")
         print("6. Edit Rules")
-        print("7. Back to Main Menu")
+        print("7. Apply changes and go back")
+        print("8. Discard changes and go back")
         edit_choice = get_input("Choose an option", "7")
 
         if edit_choice == '1':
-            client_name = ask("Unique name for the client", original_client['name'], validate_name)
-            if client_name != original_client['name'] and any(c['name'] == client_name for c in config['clients']):
+            client_name = ask("Unique name for the client", draft['name'], validate_name)
+            if client_name != original['name'] and any(c['name'] == client_name for c in config['clients']):
                 print(f"Error: A client named '{client_name}' already exists.", file=sys.stderr)
             else:
-                original_client['name'] = client_name
+                draft['name'] = client_name
         elif edit_choice == '2':
-            original_client['interface_name'] = ask("Interface name", original_client['interface_name'], validate_interface)
+            draft['interface_name'] = ask("Interface name", draft['interface_name'], validate_interface)
         elif edit_choice == '3':
-            original_client['server_address'] = ask("VPN subnet (CIDR)", original_client['server_address'], validate_server_address)
-            original_client['client_allowed_ips'] = f"{client_ip_for(original_client['server_address'])}/32"
+            draft['server_address'] = ask("VPN subnet (CIDR)", draft['server_address'], validate_server_address)
+            new_client_ip = client_ip_for(draft['server_address'])
+            draft['client_allowed_ips'] = f"{new_client_ip}/32"
+            for rule in draft['rules']: rule['target_ip'] = new_client_ip
         elif edit_choice == '4':
-            original_client['listen_port'] = ask("WireGuard Listen Port", original_client['listen_port'], validate_port)
+            draft['listen_port'] = ask("WireGuard Listen Port", draft['listen_port'], validate_port)
         elif edit_choice == '5':
-            original_client['full_tunnel'] = confirm("Full tunnel?", default=bool(original_client.get('full_tunnel')))
+            draft['full_tunnel'] = confirm("Full tunnel?", default=bool(draft.get('full_tunnel')))
         elif edit_choice == '6':
             print("\nNote: You will need to re-enter all port forwarding rules.")
-            used_ports = [c['listen_port'] for c in config['clients'] if c['name'] != original_client['name']]
+            used_ports = [c['listen_port'] for c in config['clients'] if c['name'] != original['name']]
             for c in config['clients']:
-                if c['name'] != original_client['name']: used_ports.extend([r['public_port'] for r in c['rules']])
-            original_client['rules'] = prompt_for_rules(client_ip_for(original_client['server_address']), used_ports)
+                if c['name'] != original['name']: used_ports.extend([r['public_port'] for r in c['rules']])
+            draft['rules'] = prompt_for_rules(client_ip_for(draft['server_address']), used_ports)
         elif edit_choice == '7':
+            if draft == original:
+                print("No changes to apply.")
+                break
+            if apply_client_config(draft, config['public_interface'], previous=original):
+                config['clients'][index] = draft
+                print(f"\n[+] Client '{draft['name']}' updated successfully.")
+                break
+            print(f"\n[-] Failed to apply changes for client '{draft['name']}'; the previous configuration is still in place.", file=sys.stderr)
+            print("    Adjust the settings and try again, or discard the changes.", file=sys.stderr)
+        elif edit_choice == '8':
+            print("Changes discarded.")
             break
         else:
             print("Invalid selection.", file=sys.stderr)
-
-        # Apply changes
-        print("\n[*] Applying changes...")
-        if apply_client_config(original_client, config['public_interface']):
-            config['clients'][index] = original_client
-            print(f"\n[+] Client '{original_client['name']}' updated successfully.")
-        else:
-            print(f"\n[-] Failed to apply changes for client '{original_client['name']}'.", file=sys.stderr)
 
 
 def generate_and_print_client_config(client, server_pubkey, client_privkey):

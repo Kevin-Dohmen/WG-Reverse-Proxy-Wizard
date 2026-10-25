@@ -6,7 +6,8 @@ from .actions import add_new_client, edit_existing_client, list_clients, remove_
 from .errors import ConfigError, WizardError
 from .prompts import get_input
 from .store import load_config, save_config
-from .system import check_root, enable_ip_forwarding, is_root, reapply_all_configs
+from .host import check_root, enable_ip_forwarding, is_root
+from .service import reapply_all_configs
 
 # Menu actions that change the system and therefore need root.
 MUTATING = {'2', '3', '4', '5'}
