@@ -120,3 +120,72 @@ def validate_client(client):
     except TypeError as e:
         raise ValueError(f"malformed value ({e})") from None
     return client
+
+
+# --- Uniqueness checks against the other clients ------------------------------
+# `clients` is always the list of *other* clients (the one being added or
+# edited is excluded by the caller).
+
+def check_name_free(clients, name):
+    if any(c['name'] == name for c in clients):
+        raise ValueError(f"a client named '{name}' already exists")
+
+
+def check_interface_free(clients, interface_name):
+    if any(c['interface_name'] == interface_name for c in clients):
+        raise ValueError(f"interface {interface_name} is already used by another client")
+
+
+def _udp_ports_in_use(clients, rules=()):
+    ports = {c['listen_port'] for c in clients}
+    ports |= {r['public_port'] for c in clients for r in c['rules'] if r['protocol'] == 'udp'}
+    ports |= {r['public_port'] for r in rules if r['protocol'] == 'udp'}
+    return ports
+
+
+def check_listen_port_free(clients, port, own_rules=()):
+    """A WireGuard listen port is UDP, so it also clashes with UDP forwarding rules."""
+    if port in _udp_ports_in_use(clients, own_rules):
+        raise ValueError(f"UDP port {port} is already used by another listen port or forwarding rule")
+
+
+def check_public_port_free(clients, protocol, port, own_rules=(), own_listen_port=None):
+    taken = {(r['protocol'], r['public_port']) for c in clients for r in c['rules']}
+    taken |= {(r['protocol'], r['public_port']) for r in own_rules}
+    taken |= {('udp', c['listen_port']) for c in clients}
+    if own_listen_port is not None: taken.add(('udp', own_listen_port))
+    if (protocol, port) in taken:
+        raise ValueError(f"{protocol.upper()} port {port} is already forwarded or used as a WireGuard listen port")
+
+
+def check_subnet_free(clients, server_address, host_networks=()):
+    network = ipaddress.ip_interface(server_address).network
+    for c in clients:
+        if network.overlaps(ipaddress.ip_interface(c['server_address']).network):
+            raise ValueError(f"overlaps the subnet of client '{c['name']}' ({c['server_address']})")
+    for other in host_networks:
+        if network.overlaps(other):
+            raise ValueError(f"overlaps a network already configured on this host ({other})")
+
+
+def find_conflicts(config):
+    """Human-readable list of clashes between clients already in a config."""
+    problems = []
+    clients = config['clients']
+    for i, client in enumerate(clients):
+        rest = clients[:i]  # report each pair once
+        label = f"client '{client['name']}'"
+        for check, args in (
+            (check_name_free, (client['name'],)),
+            (check_interface_free, (client['interface_name'],)),
+            (check_subnet_free, (client['server_address'],)),
+            (check_listen_port_free, (client['listen_port'], client['rules'])),
+        ):
+            try: check(rest, *args)
+            except ValueError as e: problems.append(f"{label}: {e}")
+        seen = []
+        for rule in client['rules']:
+            try: check_public_port_free(rest, rule['protocol'], rule['public_port'], seen, client['listen_port'])
+            except ValueError as e: problems.append(f"{label}: {e}")
+            seen.append(rule)
+    return problems

@@ -5,8 +5,8 @@ import sys
 
 from .errors import WizardError
 from .fsutil import write_private_file
-from .host import check_root
-from .rendering import generate_wg_config_for_client
+from .host import check_root, interface_exists
+from .rendering import MANAGED_HEADER, generate_wg_config_for_client
 
 WG_DIR = "/etc/wireguard"
 PAST_TENSE = {"start": "started", "stop": "stopped", "enable": "enabled", "disable": "disabled"}
@@ -157,3 +157,25 @@ def reapply_all_configs(config):
     else:
         print("\n[+] All configurations have been re-applied.")
     return failed
+
+
+def ensure_interface_unused(interface_name):
+    """Raise ValueError if something else already owns this interface name or conf file."""
+    if interface_exists(interface_name):
+        raise ValueError(f"a network interface named {interface_name} already exists on this host")
+    if os.path.exists(conf_path(interface_name)):
+        raise ValueError(f"{conf_path(interface_name)} already exists and is not managed by this tool's config")
+
+
+def unmanaged_confs(known_interfaces):
+    """Interfaces whose wizard-generated conf exists on disk but is missing from the config."""
+    try:
+        names = sorted(f[:-5] for f in os.listdir(WG_DIR) if f.endswith(".conf"))
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if name in known_interfaces: continue
+        text = read_conf(name)
+        if text and text.startswith(MANAGED_HEADER): found.append(name)
+    return found

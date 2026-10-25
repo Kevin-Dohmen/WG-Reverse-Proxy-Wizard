@@ -22,3 +22,8 @@ Thumbs.db
 .vscode/
 *.swp
 *~
+
+# Wizard state, backups and locks
+config.json.bak
+config.json.lock
+.tmp-*.part

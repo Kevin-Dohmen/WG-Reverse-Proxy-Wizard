@@ -2,6 +2,9 @@ import ipaddress
 
 from .validation import validate_client, validate_public_interface
 
+# First line of every conf we write; lets us tell our files from foreign ones.
+MANAGED_HEADER = "# Auto-generated for client:"
+
 
 def generate_wg_config_for_client(client_data, public_interface):
     """Generates the server-side WireGuard config content for a client.
@@ -15,7 +18,7 @@ def generate_wg_config_for_client(client_data, public_interface):
     server_subnet = str(ipaddress.ip_interface(server_address_with_subnet).network)
 
     content = [
-        f"# Auto-generated for client: {client_data['name']}",
+        f"{MANAGED_HEADER} {client_data['name']}",
         "[Interface]",
         f"Address = {client_data['server_address']}",
         f"ListenPort = {client_data['listen_port']}",

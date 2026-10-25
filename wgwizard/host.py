@@ -73,3 +73,23 @@ def get_public_ip():
     except (subprocess.CalledProcessError, ValueError, FileNotFoundError) as e:
         print(f"  > Warning: Could not determine public IP address: {e}", file=sys.stderr)
         return "<YOUR_SERVER_PUBLIC_IP>"
+
+
+def interface_exists(interface_name):
+    return os.path.exists(f"/sys/class/net/{interface_name}")
+
+
+def local_ipv4_networks(skip_interfaces=()):
+    """IPv4 networks currently configured on this host, minus the given interfaces."""
+    try:
+        output = subprocess.check_output(["ip", "-o", "-4", "addr", "show"], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    networks = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or parts[2] != "inet" or parts[1] == "lo" or parts[1] in skip_interfaces:
+            continue
+        try: networks.append(ipaddress.ip_interface(parts[3]).network)
+        except ValueError: pass
+    return networks
