@@ -4,53 +4,37 @@ import shutil
 import subprocess
 import sys
 
+from .errors import WizardError
+from .fsutil import write_private_file
 from .rendering import generate_wg_config_for_client
 
 
+def is_root():
+    return sys.platform != "win32" and os.geteuid() == 0
+
+
 def check_root():
-    """Exit if the script is not run as root on a non-Windows OS."""
+    """Raise unless the script can modify system services and configs."""
     if sys.platform == "win32":
-        print("Error: This script needs to modify system services and must be run on Linux.", file=sys.stderr)
-        sys.exit(1)
+        raise WizardError("This script needs to modify system services and must be run on Linux.")
     if os.geteuid() != 0:
-        print("Error: This script must be run as root (using 'sudo') to manage services and configs.", file=sys.stderr)
-        sys.exit(1)
+        raise WizardError("This script must be run as root (using 'sudo') to manage services and configs.")
 
 
-def enable_ip_forwarding_debian():
-    """Ensures IP forwarding is enabled using the sysctl.d directory."""
-    conf_path = '/etc/sysctl.d/99-gemini-forwarding.conf'
-    try:
-        result = subprocess.run(['sysctl', 'net.ipv4.ip_forward'], text=True, capture_output=True)
-        if "net.ipv4.ip_forward = 1" in result.stdout and os.path.exists(conf_path):
-            return # Already enabled and configured
-        with open(conf_path, 'w') as f: f.write('net.ipv4.ip_forward = 1\n')
-        subprocess.run(['sysctl', '-p', conf_path], check=True, capture_output=True)
-        print("[+] IP forwarding has been enabled for the system.")
-    except Exception as e:
-        print(f"Error enabling IP forwarding (Debian method): {e}", file=sys.stderr)
-        sys.exit(1)
+FORWARDING_CONF = '/etc/sysctl.d/99-wg-wizard-forwarding.conf'
 
 
 def enable_ip_forwarding():
-    """Ensures IP forwarding is enabled, trying the legacy method first."""
-    if not os.path.exists('/etc/sysctl.conf'):
-        enable_ip_forwarding_debian()
-        return
+    """Ensures IPv4 forwarding is on now and persisted via a sysctl.d drop-in."""
     try:
-        result = subprocess.run(['sysctl', 'net.ipv4.ip_forward'], text=True, capture_output=True)
-        if "net.ipv4.ip_forward = 1" in result.stdout: return
-        with open('/etc/sysctl.conf', 'r+') as f:
-            lines, found = f.readlines(), False
-            for line in lines:
-                if line.strip().startswith('net.ipv4.ip_forward'): found = True
-            if not found: lines.append('\nnet.ipv4.ip_forward = 1\n')
-            f.seek(0), f.truncate(), f.writelines(lines)
-        subprocess.run(['sysctl', '-p'], check=True, capture_output=True)
+        result = subprocess.run(['sysctl', '-n', 'net.ipv4.ip_forward'], text=True, capture_output=True)
+        if result.stdout.strip() == "1" and os.path.exists(FORWARDING_CONF):
+            return # Already enabled and persisted
+        write_private_file(FORWARDING_CONF, 'net.ipv4.ip_forward = 1\n', mode=0o644)
+        subprocess.run(['sysctl', '-p', FORWARDING_CONF], check=True, capture_output=True)
         print("[+] IP forwarding has been enabled for the system.")
-    except Exception as e:
-        print(f"Error enabling IP forwarding: {e}", file=sys.stderr)
-        sys.exit(1)
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise WizardError(f"Error enabling IP forwarding: {e}") from e
 
 
 def manage_service(action, interface_name, quiet=False):
@@ -87,14 +71,17 @@ def apply_client_config(client_data, public_interface):
         os.makedirs(wg_config_dir)
         print(f"  > Created directory: {wg_config_dir}")
 
-    config_content = generate_wg_config_for_client(client_data, public_interface)
+    try:
+        config_content = generate_wg_config_for_client(client_data, public_interface)
+    except ValueError as e:
+        print(f"  Error: refusing to apply invalid configuration: {e}", file=sys.stderr)
+        return False
     config_path = f"{wg_config_dir}/{iface_name}.conf"
 
     try:
-        with open(config_path, 'w') as f: f.write(config_content)
-        os.chmod(config_path, 0o600)
+        write_private_file(config_path, config_content)
         print(f"  > Configuration saved to {config_path}")
-    except IOError as e:
+    except OSError as e:
         print(f"  Error writing config file: {e}", file=sys.stderr)
         return False
 
@@ -139,21 +126,19 @@ def reapply_all_configs(config):
 
 
 def generate_keypair():
-    """Generates a WireGuard private and public key pair safely."""
+    """Generates a WireGuard private and public key pair.
+
+    The private key is handed to `wg pubkey` on stdin so it never appears in
+    any process's argument list.
+    """
     if not shutil.which("wg"):
-        print("Error: 'wg' command not found. Please install wireguard-tools.", file=sys.stderr)
-        sys.exit(1)
+        raise WizardError("'wg' command not found. Please install wireguard-tools.")
     try:
-        privkey = subprocess.check_output(["wg", "genkey"], text=True).strip()
-        p1 = subprocess.Popen(["echo", privkey], stdout=subprocess.PIPE)
-        p2 = subprocess.Popen(["wg", "pubkey"], stdin=p1.stdout, stdout=subprocess.PIPE, text=True)
-        p1.stdout.close()
-        pubkey = p2.communicate()[0].strip()
-        if p2.returncode != 0: raise subprocess.CalledProcessError(p2.returncode, p2.args)
+        privkey = subprocess.run(["wg", "genkey"], check=True, capture_output=True, text=True).stdout.strip()
+        pubkey = subprocess.run(["wg", "pubkey"], input=privkey + "\n", check=True, capture_output=True, text=True).stdout.strip()
         return privkey, pubkey
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"Error generating WireGuard keypair: {e}", file=sys.stderr)
-        sys.exit(1)
+        raise WizardError(f"Error generating WireGuard keypair: {e}") from e
 
 
 def get_default_public_interface():
@@ -169,7 +154,7 @@ def get_public_ip():
         print("  > Warning: 'curl' command not found. Unable to automatically determine public IP.", file=sys.stderr)
         return "<YOUR_SERVER_PUBLIC_IP>"
     try:
-        ip = subprocess.check_output(["curl", "-4", "-s", "ifconfig.me"], text=True).strip()
+        ip = subprocess.check_output(["curl", "-4", "-s", "-f", "--max-time", "10", "https://ifconfig.me"], text=True).strip()
         ipaddress.ip_address(ip) # Basic validation
         print(f"  > Detected public IPv4: {ip}")
         return ip

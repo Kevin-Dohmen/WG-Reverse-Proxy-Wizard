@@ -1,8 +1,15 @@
 import ipaddress
 
+from .validation import validate_client, validate_public_interface
+
 
 def generate_wg_config_for_client(client_data, public_interface):
-    """Generates the server-side WireGuard config content for a client."""
+    """Generates the server-side WireGuard config content for a client.
+
+    Raises ValueError if any value is unsafe to place in a root-executed hook.
+    """
+    validate_public_interface(public_interface)
+    validate_client(client_data)
     interface_name = client_data['interface_name']
     server_address_with_subnet = client_data['server_address']
     server_subnet = str(ipaddress.ip_interface(server_address_with_subnet).network)
