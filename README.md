@@ -47,7 +47,9 @@ Traditional WireGuard setups often dump all peers into a single flat subnet (`10
 - **No Manual Config Files:** The wizard generates `/etc/wireguard/wgX.conf`, handles key generation, and builds client configuration profiles automatically.
 - **Live Systemd Service Management:** Automatically enables, starts, stops, or restarts `wg-quick@<interface>` systemd services as changes are made.
 - **Dynamic Port Forwarding (DNAT):** Hooks directly into WireGuard's `PostUp` and `PostDown` lifecycle directives to insert clean `iptables` PREROUTING and POSTROUTING MASQUERADE rules.
-- **Conflict Prevention:** Suggests unused random subnets (`10.x.x.x/24`) and high-range WireGuard listen ports (`49152–65535`).
+- **Conflict Prevention:** Suggests unused random subnets (`10.x.x.x/24`) and high-range WireGuard listen ports (`49152–65535`), and refuses duplicate names, interfaces, overlapping subnets (also against networks already on the host) and clashing public ports.
+- **Enforced Client Isolation:** Every client gets its own `FORWARD` and `INPUT` iptables chains that only allow the forwarded ports (and their replies). Clients cannot reach each other or services on the VPS itself, and you do not need to change the global `FORWARD` policy.
+- **Safe Changes:** The old interface is stopped *before* its config is rewritten (so its firewall rules are removed correctly), failed changes are rolled back, and `config.json` is saved atomically after every change.
 - **Flexible Tunneling Modes:**
   - **Reverse Proxy Mode (Split Tunnel):** Only forwards traffic destined for the exposed ports and VPN subnet. Client default internet traffic does not pass through the VPS.
   - **Full Tunnel Mode:** Routes all client internet traffic (`0.0.0.0/0`) through the VPS gateway.
@@ -91,9 +93,13 @@ Menu:
 3. Edit a client
 4. Remove a client
 5. Re-apply all configurations
-6. Save and Exit
+6. Exit
 Choose an option [1]: 
 ```
+
+State is kept in `config.json` next to `wizard.py` (override with `-f /path/to/config.json`). It contains the server private keys, is created with `0600` permissions, and is rewritten atomically after every change (the previous version is kept as `config.json.bak`). Only one wizard instance can use a config at a time. Press `Ctrl-C` to cancel the current action and return to the menu.
+
+> **Upgrading from an older version?** Run **Re-apply all configurations** (option 5) once. It stops each interface using its existing config (removing the old firewall rules) and brings it back up with the new isolation rules.
 
 ---
 
@@ -105,18 +111,19 @@ When adding a client, the wizard prompts you for:
 1. **Client Name:** A unique descriptive identifier (e.g. `minecraft-homelab`, `jellyfin-home`).
 2. **Interface Name:** The server-side WireGuard interface (`wg0`, `wg1`, etc. - auto-incremented by default).
 3. **VPN Subnet:** A CIDR subnet for the client tunnel (defaults to an auto-generated, collision-free `10.x.x.1/24`). The server takes `.1` and the client takes `.2`.
-4. **WireGuard Listen Port:** The public UDP port the VPS listens on for this specific tunnel (auto-selected from high range).
-5. **Port Forwarding Rules (DNAT):**
+4. **Client Public Key (optional):** Paste the public key of a keypair you generated on the client (`wg genkey | tee private.key | wg pubkey`), so the client's private key never touches the server. Leave empty to have the wizard generate a keypair.
+5. **WireGuard Listen Port:** The public UDP port the VPS listens on for this specific tunnel (auto-selected from high range).
+6. **Port Forwarding Rules (DNAT):**
    - **Protocol:** `tcp` or `udp`
-   - **Public Port on Server:** The port opened on the VPS public IP.
+   - **Public Port on Server:** The port opened on the VPS public IP. Forwarding a port the VPS itself uses (such as SSH on 22) requires explicit confirmation.
    - **Target Port on Client:** The internal destination port where your local application listens.
-6. **Full Tunnel Status:** Choose `N` for standard reverse proxy (split tunnel) or `Y` to route all client traffic through the VPS.
+7. **Full Tunnel Status:** Choose `N` for standard reverse proxy (split tunnel) or `Y` to route all client traffic through the VPS.
 
 #### Immediate Deployment:
 Upon completion, the wizard:
 1. Saves `/etc/wireguard/<interface>.conf` with strict `0600` permissions.
-2. Registers and restarts `systemctl start wg-quick@<interface>`.
-3. Outputs the **Client Configuration File** to the terminal.
+2. Enables and starts `wg-quick@<interface>` (and rolls back if it fails to start).
+3. Outputs the **Client Configuration File** to the terminal. If the wizard generated the client's private key, it is shown only once and is not stored; you can save the config to a `0600` file right away.
 
 ---
 
@@ -149,10 +156,10 @@ sudo systemctl enable wg-quick@wg0
 
 ### Managing Clients
 
-- **List Clients (Option 1):** View all active clients, assigned interfaces, subnets, listen ports, and mapped forwarding rules.
-- **Edit a Client (Option 3):** Modify rules, add new forwarded ports, or toggle full-tunnel routing live.
+- **List Clients (Option 1):** View all clients with their tunnel type, live interface status (including the last handshake age), subnets, listen ports, and mapped forwarding rules.
+- **Edit a Client (Option 3):** Change any setting on a draft copy, add or remove individual forwarding rules, and apply everything at once ("Apply changes") or discard it. If applying fails, the previous configuration is restored.
 - **Remove a Client (Option 4):** Automatically tears down the systemd service, purges `/etc/wireguard/<interface>.conf`, cleans up iptables rules, and removes the client from `config.json`.
-- **Re-Apply All (Option 5):** Re-writes and reloads all interface configurations and iptables rules across all clients (useful after network reconfigurations or system updates).
+- **Re-Apply All (Option 5):** Re-writes and reloads all interface configurations and iptables rules across all clients (useful after network reconfigurations or system updates), and reports any client that failed.
 
 ---
 
@@ -200,14 +207,25 @@ Address = 10.123.8.1/24
 ListenPort = 58249
 PrivateKey = <SERVER_PRIVATE_KEY>
 
-# --- Core Routing & NAT (Reverse Proxy) ---
+# --- NAT, port forwarding (DNAT) and per-client isolation; PostDown mirrors PostUp in reverse ---
 PostUp = iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
-PostDown = iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE
-
-# --- Port Forwarding Rules (DNAT) ---
-# Minecraft Game Server (TCP 25565 -> 10.123.8.2:25565)
 PostUp = iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 25565 -j DNAT --to-destination 10.123.8.2:25565
-PostDown = iptables -t nat -D PREROUTING -i eth0 -p tcp --dport 25565 -j DNAT --to-destination 10.123.8.2:25565
+PostUp = iptables -N WGW-F-wg0 2>/dev/null || iptables -F WGW-F-wg0
+PostUp = iptables -A WGW-F-wg0 -i eth0 -o wg0 -p tcp -d 10.123.8.2 --dport 25565 -m conntrack --ctstate DNAT -j ACCEPT
+PostUp = iptables -A WGW-F-wg0 -i wg0 -o eth0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = iptables -A WGW-F-wg0 -i eth0 -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = iptables -A WGW-F-wg0 -j DROP
+PostUp = iptables -C FORWARD -i wg0 -j WGW-F-wg0 2>/dev/null || iptables -I FORWARD -i wg0 -j WGW-F-wg0
+PostUp = iptables -C FORWARD -o wg0 -j WGW-F-wg0 2>/dev/null || iptables -I FORWARD -o wg0 -j WGW-F-wg0
+PostUp = iptables -N WGW-I-wg0 2>/dev/null || iptables -F WGW-I-wg0
+PostUp = iptables -A WGW-I-wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = iptables -A WGW-I-wg0 -p icmp -j ACCEPT
+PostUp = iptables -A WGW-I-wg0 -j DROP
+PostUp = iptables -C INPUT -i wg0 -j WGW-I-wg0 2>/dev/null || iptables -I INPUT -i wg0 -j WGW-I-wg0
+PostDown = ... (the same steps undone in reverse order)
+
+# Forwarded ports:
+#   Minecraft Game Server (TCP 25565 -> 10.123.8.2:25565)
 
 [Peer]
 # Client: minecraft-server
@@ -251,9 +269,23 @@ sudo ufw allow 58249/udp
 # Allow the public forwarded port
 sudo ufw allow 25565/tcp
 ```
-Ensure default forward policy allows routed packets in `/etc/default/ufw`:
-```ini
-DEFAULT_FORWARD_POLICY="ACCEPT"
+The wizard inserts its `FORWARD` and `INPUT` chains ahead of UFW's, so forwarded traffic works without changing `DEFAULT_FORWARD_POLICY`. Only the public ports and the WireGuard listen port need to be opened as above.
+
+### Client Isolation
+All traffic entering or leaving a client's `wgX` interface passes through that client's `WGW-F-wgX` (forwarding) and `WGW-I-wgX` (to the VPS itself) chains, which end in `DROP`:
+
+- Clients cannot connect to each other or to other networks through the VPS (full-tunnel clients may reach the internet).
+- Clients can only ping the VPS; they cannot connect to services listening on it.
+- Inspect them with `sudo iptables -L WGW-F-wg0 -v -n`.
+
+---
+
+## Development
+
+The code lives in the `wgwizard/` package (`wizard.py` is just the entry point). The unit tests use only the standard library, mock out `systemctl`/`wg`, and run on any OS:
+
+```bash
+python -m unittest discover -s tests -t .
 ```
 
 ---
